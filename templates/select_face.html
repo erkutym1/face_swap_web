@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <title>Yüz Seçimi ve Yüz Değiştirme</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body style="background-color: #808080">
+    <h2>Videodan Ayıklanan Yüzleri Seçin</h2>
+
+    <div class="faces-container" id="facesContainer">
+        {% for face_file in face_files %}
+        <div class="face-item" data-id="{{ face_file }}">
+            <img src="{{ url_for('static', filename='faces/' + face_file) }}" alt="Yüz {{ face_file }}" />
+        </div>
+        {% endfor %}
+    </div>
+
+    <form id="faceForm" method="post" enctype="multipart/form-data" novalidate>
+        <input type="hidden" name="selected_face" id="selectedFaceInput" />
+        <label for="face_image">Yeni Yüz Fotoğrafı Yükleyin:</label>
+        <input type="file" name="face_image" id="faceImageInput" accept="image/*" required />
+        <div id="selected-file-name"></div>
+
+        <div id="error-msg" style="color:red; margin-top:10px;"></div>
+
+        <button type="submit">Yüzü Değiştir</button>
+    </form>
+
+    <script>
+        const facesContainer = document.getElementById('facesContainer');
+        const selectedFaceInput = document.getElementById('selectedFaceInput');
+        const form = document.getElementById('faceForm');
+        const errorMsg = document.getElementById('error-msg');
+        const faceImageInput = document.getElementById('faceImageInput');
+        const selectedFileName = document.getElementById('selected-file-name');
+
+        facesContainer.addEventListener('click', (event) => {
+            let target = event.target;
+            if (target.tagName === 'IMG') {
+                target = target.parentElement;
+            }
+
+            if (target.classList.contains('face-item')) {
+                document.querySelectorAll('.face-item').forEach(item => item.classList.remove('selected'));
+                target.classList.add('selected');
+                selectedFaceInput.value = target.getAttribute('data-id');
+                errorMsg.textContent = '';
+            }
+        });
+
+        faceImageInput.addEventListener('change', () => {
+            if (faceImageInput.files.length > 0) {
+                selectedFileName.textContent = "Seçilen dosya: " + faceImageInput.files[0].name;
+                errorMsg.textContent = '';
+            } else {
+                selectedFileName.textContent = "";
+            }
+        });
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            if (!selectedFaceInput.value) {
+                errorMsg.textContent = 'Lütfen bir yüz seçin!';
+                return;
+            }
+            if (!faceImageInput.value) {
+                errorMsg.textContent = 'Lütfen yeni yüz için bir fotoğraf yükleyin!';
+                return;
+            }
+
+            errorMsg.textContent = '';
+
+            const formData = new FormData(form);
+
+            try {
+                const response = await fetch("{{ url_for('process') }}", {
+                    method: "POST",
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    errorMsg.textContent = `Hata: ${errorText}`;
+                    return;
+                }
+
+                const data = await response.json();
+
+                if (data.message) {
+                    // İşlem başladı, swapping sayfasına yönlendir
+                    window.location.href = "{{ url_for('swapping') }}";
+                } else {
+                    errorMsg.textContent = 'Bilinmeyen hata oluştu.';
+                }
+            } catch (err) {
+                errorMsg.textContent = 'İstek sırasında hata oluştu: ' + err.message;
+            }
+        });
+    </script>
+</body>
+</html>

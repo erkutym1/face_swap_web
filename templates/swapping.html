@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>Yüz Değiştiriliyor...</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body style="background-color: #808080">
+
+
+    <div class="loader-wrapper">
+        <h2>Yüz değiştirme işlemi devam ediyor...</h2>
+
+        <div class="loader"></div>
+
+        <div class="progress-bar">
+            <div class="progress-bar-inner" id="progressBar">0%</div>
+        </div>
+
+    </div>
+
+
+
+    <script>
+        function checkProgress() {
+            fetch("/progress")
+                .then(response => response.json())
+                .then(data => {
+                    const progress = data.progress || 0;
+                    const status = data.status || 'processing';
+
+                    document.getElementById('progressBar').style.width = progress + '%';
+                    document.getElementById('progressBar').textContent = progress + "%";
+
+                    if (status === 'done_swap') {
+                        window.location.href = "/result"; // sonuç sayfasına yönlendir
+                    } else if (status === 'error') {
+                        document.getElementById('progressBar').textContent = "Hata oluştu. Lütfen tekrar deneyin.";
+                    } else {
+                        setTimeout(checkProgress, 1000); // 1 sn sonra tekrar dene
+                    }
+                });
+        }
+
+        checkProgress();
+    </script>
+</body>
+</html>

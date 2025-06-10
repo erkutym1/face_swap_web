@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <title>Yüz Ayıklama İlerleme</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="extract-progress" style="background-color: #808080">
+    <h2>Videodan yüzler ayıklanıyor...</h2>
+
+    <div class="loader-wrapper">
+        <div class="loader"></div>
+
+        <div class="progress-bar">
+            <div class="progress-bar-inner" id="progressBar">0%</div>
+        </div>
+    </div>
+
+
+    <script>
+        function checkProgress() {
+            fetch('/progress_extract')
+                .then(res => res.json())
+                .then(data => {
+                    const bar = document.getElementById('progressBar');
+                    bar.style.width = data.progress + '%';
+                    bar.textContent = data.progress + '%';
+
+                    // Burayı backend status ile aynı yapıyoruz:
+                    if (data.status === 'done_extract') {
+                        window.location.href = '/select_face';
+                    } else {
+                        setTimeout(checkProgress, 500);
+                    }
+                })
+                .catch(() => {
+                    setTimeout(checkProgress, 2000);
+                });
+        }
+
+        checkProgress();
+    </script>
+</body>
+</html>

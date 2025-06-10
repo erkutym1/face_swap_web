@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <title>Video Yükle</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        #filename {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #333;
+        }
+        body { background-color: #808080; }
+    </style>
+</head>
+<body style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px;">
+
+    <h1>Video Yükle ve Yüz Ayıkla</h1>
+
+    <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+        <label for="video" class="file-input-label">
+            <svg class="svgIcon" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+                <path d="M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zm50.7-186.9L162.4 380.6c-19.4 7.5-38.5-11.6-31-31l55.5-144.3c3.3-8.5 9.9-15.1 18.4-18.4l144.3-55.5c19.4-7.5 38.5 11.6 31 31L325.1 306.7c-3.2 8.5-9.9 15.1-18.4 18.4zM288 256a32 32 0 1 0 -64 0 32 32 0 1 0 64 0z"/>
+            </svg>
+            Video Seç
+        </label>
+        <input type="file" name="video" id="video" accept="video/*" required hidden onchange="updateFileName()" />
+
+        <div id="filename">Henüz dosya seçilmedi</div>
+
+        <button type="submit" class="button">Yükle</button>
+    </form>
+
+    <script>
+        function updateFileName() {
+            const input = document.getElementById('video');
+            const label = document.getElementById('filename');
+            if (input.files.length > 0) {
+                label.textContent = "Seçilen dosya: " + input.files[0].name;
+            } else {
+                label.textContent = "Henüz dosya seçilmedi";
+            }
+        }
+    </script>
+
+</body>
+</html>
