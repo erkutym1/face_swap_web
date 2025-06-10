@@ -1,3 +1,5 @@
+import os
+
 import cv2
 import numpy as np
 import dlib
@@ -188,6 +190,35 @@ def create_smooth_mask(points, image_shape, feather_amount=15):
     return mask_smooth
 
 
+def safe_get_video_property(cap, prop):
+    """Video özelliklerini güvenli şekilde al"""
+    try:
+        value = cap.get(prop)
+        if value is None or np.isnan(value) or np.isinf(value):
+            return None
+        return int(value) if prop in [cv2.CAP_PROP_FRAME_COUNT, cv2.CAP_PROP_FRAME_WIDTH,
+                                      cv2.CAP_PROP_FRAME_HEIGHT] else value
+    except Exception as e:
+        print(f"Video özelliği alınırken hata: {e}")
+        return None
+
+
+def count_frames_manually(cap):
+    """Frame sayısını manuel olarak say"""
+    current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    frame_count = 0
+    while True:
+        ret, _ = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+    return frame_count
+
+
 def swap_faces(video_path, new_face_path, output_path, target_id=None, progress_status=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Kullanılan cihaz: {device}")
@@ -196,16 +227,47 @@ def swap_faces(video_path, new_face_path, output_path, target_id=None, progress_
     predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
     cap = cv2.VideoCapture(video_path)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if not cap.isOpened():
+        raise Exception(f"Video açılamadı: {video_path}")
+
+    # Video özelliklerini güvenli şekilde al
+    fps = safe_get_video_property(cap, cv2.CAP_PROP_FPS)
+    width = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_WIDTH)
+    height = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_HEIGHT)
+    frame_count = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_COUNT)
+
+    # Varsayılan değerler
+    if fps is None or fps <= 0:
+        fps = 30.0
+        print("FPS okunamadı, varsayılan 30 FPS kullanılıyor")
+
+    if width is None or height is None:
+        # İlk frame'den boyutları al
+        ret, first_frame = cap.read()
+        if ret:
+            height, width = first_frame.shape[:2]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Başa dön
+        else:
+            raise Exception("Video boyutları okunamadı")
+
+    if frame_count is None or frame_count <= 0:
+        print("Frame sayısı okunamadı, manuel sayım yapılıyor...")
+        frame_count = count_frames_manually(cap)
+        print(f"Toplam frame sayısı: {frame_count}")
+
+    # Video writer'ı oluştur
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (int(width), int(height)))
+
+    if not out.isOpened():
+        raise Exception(f"Çıkış video dosyası oluşturulamadı: {output_path}")
 
     # Yeni yüz resmini yükle ve landmark'larını çıkar
     new_face_img = cv2.imread(new_face_path)
+    if new_face_img is None:
+        raise Exception(f"Yeni yüz resmi yüklenemedi: {new_face_path}")
+
     new_face_gray = cv2.cvtColor(new_face_img, cv2.COLOR_BGR2GRAY)
     new_faces = detector(new_face_gray)
     if len(new_faces) == 0:
@@ -221,124 +283,136 @@ def swap_faces(video_path, new_face_path, output_path, target_id=None, progress_
     new_face_tensor = to_tensor(new_face_img).to(device)
 
     frame_index = 0
+    processed_frames = 0
+
+    print(f"Video işleme başlıyor... Toplam frame: {frame_count}")
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Orijinal frame'i GPU'ya taşı
-        frame_tensor = to_tensor(frame).to(device)
+        try:
+            # Orijinal frame'i GPU'ya taşı
+            frame_tensor = to_tensor(frame).to(device)
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = detector(gray)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = detector(gray)
 
-        if len(faces) > 0:
-            face = faces[0]
-            landmarks = predictor(gray, face)
-            points_68 = np.array([[p.x, p.y] for p in landmarks.parts()], dtype=np.float32)
+            if len(faces) > 0:
+                face = faces[0]
+                landmarks = predictor(gray, face)
+                points_68 = np.array([[p.x, p.y] for p in landmarks.parts()], dtype=np.float32)
 
-            # Hedef yüz için genişletilmiş noktalar
-            target_points_enhanced = get_enhanced_face_points(landmarks)
+                # Hedef yüz için genişletilmiş noktalar
+                target_points_enhanced = get_enhanced_face_points(landmarks)
 
-            # Detaylı triangulation
-            triangles, all_target_points = get_detailed_triangulation(target_points_enhanced, frame.shape)
-            _, all_source_points = get_detailed_triangulation(new_points_enhanced, new_face_img.shape)
+                # Detaylı triangulation
+                triangles, all_target_points = get_detailed_triangulation(target_points_enhanced, frame.shape)
+                _, all_source_points = get_detailed_triangulation(new_points_enhanced, new_face_img.shape)
 
-            print(f"Toplam üçgen sayısı: {len(triangles)}")
+                # Warped face'i GPU'da oluştur
+                warped_face = torch.zeros((3, int(height), int(width)), dtype=torch.float32, device=device)
+                accumulated_mask = torch.zeros((int(height), int(width)), dtype=torch.float32, device=device)
 
-            # Warped face'i GPU'da oluştur
-            warped_face = torch.zeros((3, height, width), dtype=torch.float32, device=device)
-            accumulated_mask = torch.zeros((height, width), dtype=torch.float32, device=device)
+                # Her üçgen için warp işlemi
+                valid_triangles = 0
+                for tri_idx in triangles:
+                    # Üçgen noktalarının geçerli olup olmadığını kontrol et
+                    if (tri_idx < len(all_target_points)).all() and (tri_idx < len(all_source_points)).all():
 
-            # Her üçgen için warp işlemi
-            valid_triangles = 0
-            for tri_idx in triangles:
-                # Üçgen noktalarının geçerli olup olmadığını kontrol et
-                if (tri_idx < len(all_target_points)).all() and (tri_idx < len(all_source_points)).all():
+                        target_tri = all_target_points[tri_idx].astype(np.float32)
+                        source_tri = all_source_points[tri_idx].astype(np.float32)
 
-                    target_tri = all_target_points[tri_idx].astype(np.float32)
-                    source_tri = all_source_points[tri_idx].astype(np.float32)
+                        # Çok küçük üçgenleri atla
+                        if cv2.contourArea(target_tri) < 10:
+                            continue
 
-                    # Çok küçük üçgenleri atla
-                    if cv2.contourArea(target_tri) < 10:
-                        continue
+                        try:
+                            # Affine transformation
+                            M = cv2.getAffineTransform(source_tri, target_tri)
 
-                    try:
-                        # Affine transformation
-                        M = cv2.getAffineTransform(source_tri, target_tri)
+                            # GPU'da warp işlemi
+                            warped_tri = warp_affine_torch(new_face_tensor, M, (int(width), int(height)))
 
-                        # GPU'da warp işlemi
-                        warped_tri = warp_affine_torch(new_face_tensor, M, (width, height))
+                            # Üçgen maskesi oluştur
+                            mask_tri = np.zeros((int(height), int(width)), dtype=np.uint8)
+                            cv2.fillConvexPoly(mask_tri, target_tri.astype(np.int32), 1)
 
-                        # Üçgen maskesi oluştur
-                        mask_tri = np.zeros((height, width), dtype=np.uint8)
-                        cv2.fillConvexPoly(mask_tri, target_tri.astype(np.int32), 1)
-                        mask_tri_tensor = torch.from_numpy(mask_tri).to(device).float()
+                            # Anti-aliasing için hafif blur
+                            mask_tri_blurred = cv2.GaussianBlur(mask_tri, (3, 3), 0.5)
+                            mask_tri_tensor = torch.from_numpy(mask_tri_blurred).to(device).float() / 255.0
 
-                        # Anti-aliasing için hafif blur
-                        mask_tri_tensor = torch.from_numpy(
-                            cv2.GaussianBlur(mask_tri, (3, 3), 0.5)
-                        ).to(device).float() / 255.0
+                            # Maskeyi uygula
+                            mask_tri_3d = mask_tri_tensor.unsqueeze(0)
+                            warped_face += warped_tri * mask_tri_3d
+                            accumulated_mask += mask_tri_tensor
 
-                        # Maskeyi uygula
-                        mask_tri_3d = mask_tri_tensor.unsqueeze(0)
-                        warped_face += warped_tri * mask_tri_3d
-                        accumulated_mask += mask_tri_tensor
+                            valid_triangles += 1
 
-                        valid_triangles += 1
+                        except Exception as e:
+                            continue
 
-                    except Exception as e:
-                        continue
+                # Accumulated mask ile normalize et
+                accumulated_mask = torch.clamp(accumulated_mask, min=1e-6)
+                warped_face = warped_face / accumulated_mask.unsqueeze(0)
 
-            print(f"İşlenen geçerli üçgen sayısı: {valid_triangles}")
+                # Gelişmiş yüz maskesi oluştur (alın dahil)
+                face_mask_smooth = create_smooth_mask(target_points_enhanced, frame.shape, feather_amount=20)
+                face_mask_tensor = torch.from_numpy(face_mask_smooth).to(device).float() / 255.0
 
-            # Accumulated mask ile normalize et
-            accumulated_mask = torch.clamp(accumulated_mask, min=1e-6)
-            warped_face = warped_face / accumulated_mask.unsqueeze(0)
+                # Multi-level blending
+                alpha = face_mask_tensor.unsqueeze(0)
+                blended = alpha * warped_face + (1 - alpha) * frame_tensor
 
-            # Gelişmiş yüz maskesi oluştur (alın dahil)
-            face_mask_smooth = create_smooth_mask(target_points_enhanced, frame.shape, feather_amount=20)
-            face_mask_tensor = torch.from_numpy(face_mask_smooth).to(device).float() / 255.0
+                # Sonucu CPU'ya geri al
+                output = to_numpy(blended.clamp(0, 1))
 
-            # Multi-level blending
-            # 1. Ana maske ile alpha blending
-            alpha = face_mask_tensor.unsqueeze(0)
-            blended = alpha * warped_face + (1 - alpha) * frame_tensor
+                # Opsiyonel: Son rötuş için OpenCV seamlessClone
+                center = (face.left() + face.width() // 2, face.top() + face.height() // 2)
+                try:
+                    # Sadece merkezi yüz bölgesi için seamless clone
+                    center_mask = create_smooth_mask(points_68, frame.shape, feather_amount=10)
+                    warped_face_cpu = to_numpy(warped_face.clamp(0, 1))
+                    output_seamless = cv2.seamlessClone(warped_face_cpu, output, center_mask, center, cv2.NORMAL_CLONE)
 
-            # 2. Detay iyileştirme için edge-aware smoothing
-            # Gradyan bazlı ağırlıklandırma
-            gray_tensor = torch.mean(frame_tensor, dim=0, keepdim=True)
-            grad_x = torch.abs(gray_tensor[:, :, 1:] - gray_tensor[:, :, :-1])
-            grad_y = torch.abs(gray_tensor[:, 1:, :] - gray_tensor[:, :-1, :])
+                    # İki sonucu karıştır (seams için)
+                    blend_ratio = 0.7
+                    output = cv2.addWeighted(output, 1 - blend_ratio, output_seamless, blend_ratio, 0)
 
-            # Sonucu CPU'ya geri al
-            output = to_numpy(blended.clamp(0, 1))
+                except Exception as e:
+                    # Hata durumunda GPU blending sonucunu kullan
+                    pass
 
-            # Opsiyonel: Son rötuş için OpenCV seamlessClone
-            center = (face.left() + face.width() // 2, face.top() + face.height() // 2)
-            try:
-                # Sadece merkezi yüz bölgesi için seamless clone
-                center_mask = create_smooth_mask(points_68, frame.shape, feather_amount=10)
-                warped_face_cpu = to_numpy(warped_face.clamp(0, 1))
-                output_seamless = cv2.seamlessClone(warped_face_cpu, output, center_mask, center, cv2.NORMAL_CLONE)
+            else:
+                output = frame
 
-                # İki sonucu karıştır (seams için)
-                blend_ratio = 0.7
-                output = cv2.addWeighted(output, 1 - blend_ratio, output_seamless, blend_ratio, 0)
+            out.write(output)
+            processed_frames += 1
 
-            except Exception as e:
-                print(f"Seamless clone hatası: {e}")
-                # Hata durumunda GPU blending sonucunu kullan
-                pass
-
-        else:
-            output = frame
-
-        out.write(output)
+        except Exception as e:
+            print(f"Frame {frame_index} işlenirken hata: {e}")
+            # Hata durumunda orijinal frame'i yaz
+            out.write(frame)
+            processed_frames += 1
 
         frame_index += 1
-        if progress_status is not None:
+
+        # Progress güncelle
+        if progress_status is not None and frame_count > 0:
             progress_status['progress'] = int((frame_index / frame_count) * 100)
+
+        # Her 30 frame'de bir ilerleme raporu
+        if frame_index % 30 == 0:
+            print(f"İşlenen frame: {frame_index}/{frame_count} ({(frame_index / frame_count * 100):.1f}%)")
 
     cap.release()
     out.release()
+
+    print(f"Video işleme tamamlandı. Toplam işlenen frame: {processed_frames}")
+
+    # Çıkış dosyasının var olup olmadığını kontrol et
+    if not os.path.exists(output_path):
+        raise Exception("Çıkış video dosyası oluşturulamadı")
+
+    return processed_frames

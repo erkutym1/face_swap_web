@@ -187,20 +187,46 @@ def calculate_face_quality(face_region, landmarks=None):
     return quality_score
 
 
+def safe_get_video_property(cap, prop):
+    """Video özelliklerini güvenle al"""
+    try:
+        value = cap.get(prop)
+        if value is None or np.isnan(value) or np.isinf(value):
+            return None
+        return int(value) if prop in [cv2.CAP_PROP_FRAME_COUNT, cv2.CAP_PROP_FRAME_WIDTH,
+                                      cv2.CAP_PROP_FRAME_HEIGHT] else value
+    except Exception as e:
+        print(f"Video özelliği alınırken hata: {e}")
+        return None
+
+
+def count_frames_manually(cap):
+    """Frame sayısını manuel olarak say"""
+    current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    frame_count = 0
+    while True:
+        ret, _ = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+    return frame_count
+
+
 def extract_distinct_faces(video_path, output_folder, max_frames=50, tolerance=0.6,
                            min_face_size=60, quality_threshold=0.3, progress_status=None):
-    """Geliştirilmiş yüz çıkarma fonksiyonu"""
+    """Optimize edilmiş yüz çıkarma fonksiyonu"""
     os.makedirs(output_folder, exist_ok=True)
 
-    # CUDA kullanılabilirliğini kontrol et
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Kullanılan cihaz: {device}")
 
-    # Basit yüz tanıma ağını oluştur
     face_net = SimpleFaceNet().to(device)
     face_net.eval()
 
-    # Görüntü dönüştürme pipeline'ı
     transform = transforms.Compose([
         transforms.Resize((128, 128)),
         transforms.ToTensor(),
@@ -209,182 +235,156 @@ def extract_distinct_faces(video_path, output_folder, max_frames=50, tolerance=0
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise Exception(f"Video açılamadı: {video_path}")
+        raise IOError(f"Video açılamadı: {video_path}")
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    max_frames = min(max_frames, total_frames)
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    # Video özelliklerini güvenli şekilde al
+    total_frames = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_COUNT)
 
-    # Frame atlama stratejisi (eşit aralıklarla)
-    frame_skip = max(1, total_frames // max_frames) if max_frames < total_frames else 1
+    if total_frames is None or total_frames <= 0:
+        print("Frame sayısı okunamadı, manuel sayım yapılıyor...")
+        total_frames = count_frames_manually(cap)
+        print(f"Toplam frame sayısı: {total_frames}")
+        # Başa dön
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    known_encodings = []
-    face_qualities = []  # Her yüz için kalite skoru
-    face_id = 0
-    face_map = {}
-    frame_count = 0
-    processed_frames = 0
+    # max_frames parametresi varsa kullan, yoksa tüm videoyu işle
+    if max_frames is None or max_frames <= 0:
+        max_frames = total_frames
+    else:
+        max_frames = min(max_frames, total_frames)
 
-    print(f"Toplam {total_frames} frame, {frame_skip} frame atlayarak işlenecek")
+    frame_skip = max(1, total_frames // 100)  # En fazla 100 frame işle
+    if frame_skip < 30:
+        frame_skip = 30  # En az 30 frame atlama
 
-    while cap.isOpened() and processed_frames < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    print(f"Toplam {total_frames} frame, {frame_skip} aralıkla işlenecek, maksimum {max_frames} frame")
 
-        # Frame atlama
-        if frame_count % frame_skip != 0:
+    known_encodings, face_qualities, face_map = [], [], {}
+    face_id = frame_count = processed_frames = 0
+
+    try:
+        while cap.isOpened() and processed_frames < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_count % frame_skip != 0:
+                frame_count += 1
+                continue
+
+            try:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w = frame.shape[:2]
+                face_locations = detect_faces_enhanced(rgb_frame, device, min_face_size)
+
+                for loc in face_locations:
+                    try:
+                        top, right, bottom, left = map(int, loc)
+                        top, left = max(0, top), max(0, left)
+                        bottom, right = min(h, bottom), min(w, right)
+
+                        # Geçerli koordinatları kontrol et
+                        if top >= bottom or left >= right:
+                            continue
+
+                        face_region = rgb_frame[top:bottom, left:right]
+
+                        if face_region.size == 0 or face_region.shape[0] < 10 or face_region.shape[1] < 10:
+                            continue
+
+                        quality = calculate_face_quality(face_region)
+                        if quality < quality_threshold:
+                            continue
+
+                        face_pil = Image.fromarray(face_region)
+                        face_tensor = transform(face_pil).unsqueeze(0).to(device)
+
+                        with torch.no_grad():
+                            encoding = face_net(face_tensor).cpu().numpy().flatten()
+
+                        similarity_scores = []
+                        for ke in known_encodings:
+                            try:
+                                sim = np.dot(encoding, ke) / (np.linalg.norm(encoding) * np.linalg.norm(ke) + 1e-6)
+                                similarity_scores.append(sim)
+                            except Exception as e:
+                                similarity_scores.append(0.0)
+
+                        if similarity_scores:
+                            max_sim = max(similarity_scores)
+                            match_idx = np.argmax(similarity_scores)
+                        else:
+                            max_sim = -1
+                            match_idx = -1
+
+                        # Benzerlik eşiği - tolerance parametresini kullan
+                        matched = max_sim > tolerance
+
+                        def save_face(face_img, fid):
+                            try:
+                                path = os.path.join(output_folder, f"{fid}.jpg")
+                                # BGR formatına çevir (OpenCV için)
+                                face_bgr = cv2.cvtColor(face_img, cv2.COLOR_RGB2BGR)
+                                if cv2.imwrite(path, face_bgr):
+                                    face_map[str(fid)] = (frame_count, left, top, right - left, bottom - top)
+                                    return True
+                                return False
+                            except Exception as e:
+                                print(f"Yüz kaydetme hatası: {e}")
+                                return False
+
+                        print(
+                            f"Frame {frame_count}: Max sim: {max_sim:.3f}, matched: {matched}, quality: {quality:.3f}")
+
+                        if matched and match_idx < len(face_qualities):
+                            # Daha iyi kalitedeyse güncelle
+                            if quality > face_qualities[match_idx]:
+                                known_encodings[match_idx] = encoding
+                                face_qualities[match_idx] = quality
+                                # Eski dosyayı güncelle
+                                if save_face(face_region, match_idx):
+                                    print(f"Yüz güncellendi: {match_idx}.jpg (kalite: {quality:.3f})")
+                        else:
+                            # Yeni yüz
+                            if save_face(face_region, face_id):
+                                print(f"Yeni yüz kaydedildi: {face_id}.jpg (kalite: {quality:.3f})")
+                                known_encodings.append(encoding)
+                                face_qualities.append(quality)
+                                face_id += 1
+
+                    except Exception as e:
+                        print(f"Yüz işleme hatası: {e}")
+                        continue
+
+            except Exception as e:
+                print(f"Frame {frame_count} işleme hatası: {e}")
+
             frame_count += 1
-            continue
+            processed_frames += 1
 
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_height, frame_width = frame.shape[:2]
-
-        # Geliştirilmiş yüz algılama
-        face_locations = detect_faces_enhanced(rgb_frame, device, min_face_size)
-
-        face_encodings = []
-        face_qualities_current = []
-
-        for location in face_locations:
-            top, right, bottom, left = location
-
-            # Sınır dışı kesimleri engelle
-            top = max(0, top)
-            left = max(0, left)
-            bottom = min(frame_height, bottom)
-            right = min(frame_width, right)
-
-            # Yüz bölgesini kırp
-            face_region = rgb_frame[top:bottom, left:right]
-
-            if face_region.size == 0:
-                face_encodings.append(None)
-                face_qualities_current.append(0.0)
-                continue
-
-            # Yüz kalitesini değerlendir
-            quality_score = calculate_face_quality(face_region)
-            face_qualities_current.append(quality_score)
-
-            # Kalite eşiğinin altındaki yüzleri atla
-            if quality_score < quality_threshold:
-                face_encodings.append(None)
-                continue
-
-            # PIL Image'a çevir
-            face_pil = Image.fromarray(face_region)
-
-            # Tensor'a çevir ve GPU'ya gönder
-            face_tensor = transform(face_pil).unsqueeze(0).to(device)
-
-            # Yüz kodlamasını al (GPU'da)
-            with torch.no_grad():
-                encoding = face_net(face_tensor).cpu().numpy().flatten()
-
-            face_encodings.append(encoding)
-
-        print(f"Frame {processed_frames}/{max_frames}: {len(face_locations)} yüz bulundu, "
-              f"{sum(1 for enc in face_encodings if enc is not None)} kaliteli yüz")
-
-        for i, (location, encoding, quality) in enumerate(zip(face_locations, face_encodings, face_qualities_current)):
-            if encoding is None:
-                continue
-
-            is_new_face = True
-            best_match_idx = -1
-            max_similarity = 0
-
-            if known_encodings:
-                # Cosine similarity ile karşılaştırma
-                similarities = []
-                for j, known_encoding in enumerate(known_encodings):
-                    dot_product = np.dot(encoding, known_encoding)
-                    norm_a = np.linalg.norm(encoding)
-                    norm_b = np.linalg.norm(known_encoding)
-                    if norm_a > 0 and norm_b > 0:
-                        similarity = dot_product / (norm_a * norm_b)
-                        similarities.append(similarity)
-                    else:
-                        similarities.append(0)
-
-                if similarities:
-                    max_similarity = max(similarities)
-                    best_match_idx = similarities.index(max_similarity)
-
-                    # Tolerance'ı similarity threshold'a çevir
-                    if max_similarity > (1 - tolerance):
-                        is_new_face = False
-
-                        # Eğer yeni yüz daha kaliteliyse güncelle
-                        if quality > face_qualities[best_match_idx]:
-                            print(
-                                f"Daha kaliteli yüz bulundu (kalite: {quality:.3f} > {face_qualities[best_match_idx]:.3f})")
-
-                            # Eski dosyayı sil
-                            old_face_path = os.path.join(output_folder, f"{best_match_idx}.jpg")
-                            if os.path.exists(old_face_path):
-                                os.remove(old_face_path)
-
-                            # Yeni yüzü kaydet
-                            top, right, bottom, left = location
-                            top = max(0, top)
-                            left = max(0, left)
-                            bottom = min(frame_height, bottom)
-                            right = min(frame_width, right)
-
-                            face_img = frame[top:bottom, left:right]
-                            face_filename = f"{best_match_idx}.jpg"
-                            face_path = os.path.join(output_folder, face_filename)
-                            success = cv2.imwrite(face_path, face_img)
-
-                            if success:
-                                print(f"Yüz güncellendi: {face_filename}")
-                                known_encodings[best_match_idx] = encoding
-                                face_qualities[best_match_idx] = quality
-                                face_map[str(best_match_idx)] = (frame_count, left, top, right - left, bottom - top)
-
-            if is_new_face:
-                # Yeni yüz algılandı
-                known_encodings.append(encoding)
-                face_qualities.append(quality)
-                top, right, bottom, left = location
-
-                # Sınır dışı kesimleri engelle
-                top = max(0, top)
-                left = max(0, left)
-                bottom = min(frame_height, bottom)
-                right = min(frame_width, right)
-
-                face_img = frame[top:bottom, left:right]
-                face_filename = f"{face_id}.jpg"
-                face_path = os.path.join(output_folder, face_filename)
-                success = cv2.imwrite(face_path, face_img)
-
-                if success:
-                    print(f"Yeni yüz kaydedildi: {face_filename} (kalite: {quality:.3f})")
-                else:
-                    print(f"Dosya kaydedilemedi: {face_filename}")
-
-                face_map[str(face_id)] = (frame_count, left, top, right - left, bottom - top)
-                face_id += 1
-
-        frame_count += 1
-        processed_frames += 1
-
-        if progress_status is not None:
-            progress_status['progress'] = int((processed_frames / max_frames) * 100)
-
-        if processed_frames >= max_frames:
+            # İlerleme güncelle
             if progress_status is not None:
-                progress_status['status'] = 'done_extract'
-                progress_status['progress'] = 100
-            break
+                progress_status['progress'] = int((processed_frames / max_frames) * 100)
 
-    cap.release()
+            # Her 10 frame'de bir rapor
+            if processed_frames % 10 == 0:
+                print(f"İşlenen frame: {processed_frames}/{max_frames} ({processed_frames / max_frames * 100:.1f}%)")
 
-    print(f"\nÇıkarma tamamlandı:")
-    print(f"- Toplam {face_id} farklı yüz bulundu")
-    print(f"- Ortalama yüz kalitesi: {np.mean(face_qualities):.3f}")
+    except Exception as e:
+        print(f"Genel hata: {e}")
+    finally:
+        cap.release()
+
+    if progress_status is not None:
+        progress_status['status'] = 'done_extract'
+        progress_status['progress'] = 100
+
+    print(f"\nİşlem tamamlandı. {face_id} farklı yüz bulundu.")
+    if face_qualities:
+        print(f"Ortalama kalite: {np.mean(face_qualities):.3f}")
+        print(f"En yüksek kalite: {np.max(face_qualities):.3f}")
+        print(f"En düşük kalite: {np.min(face_qualities):.3f}")
+    else:
+        print("Yüz bulunamadı.")
 
     return face_map
