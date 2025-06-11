@@ -1,8 +1,12 @@
 Flask
 opencv-python
+torch
+torchvision
 numpy
 dlib
-torch
+mediapipe
+face-recognition
+moviepy
 scipy
-torchvision
 pillow
+scikit-learn

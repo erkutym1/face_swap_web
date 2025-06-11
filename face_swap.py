@@ -1,11 +1,25 @@
 import os
+import uuid
 
 import cv2
-import numpy as np
-import dlib
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
+from moviepy import VideoFileClip, AudioFileClip
 from scipy.spatial import Delaunay
+from torchvision.ops import nms
+import numpy as np
+from PIL import Image
+import dlib
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_similarity
+import mediapipe as mp
+from facenet_pytorch import MTCNN, InceptionResnetV1
+import face_recognition
+from collections import defaultdict
+import threading
+import time
 
 
 def to_tensor(img):
@@ -219,200 +233,315 @@ def count_frames_manually(cap):
     return frame_count
 
 
-def swap_faces(video_path, new_face_path, output_path, target_id=None, progress_status=None):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Kullanılan cihaz: {device}")
+def swap_faces(video_path, new_face_path, output_path, progress_status):
+    """
+    Bir videodaki yüzü, verilen bir resimdeki yüz ile değiştiren ana fonksiyon.
+    Ses ve video ayrıştırma/birleştirme stratejisi ile güncellenmiştir.
+    """
+    # Cihazı ayarla (GPU varsa kullan, yoksa CPU)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f'Uygulama şu cihazda çalışıyor: {device}')
 
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+    # Geçici dosyalar için benzersiz ID
+    unique_id = str(uuid.uuid4())
+    temp_dir = "temp"  # Geçici dosyaların kaydedileceği klasör
+    os.makedirs(temp_dir, exist_ok=True)  # temp klasörünü oluştur
 
-    cap = cv2.VideoCapture(video_path)
+    temp_video_no_audio_path = os.path.join(temp_dir, f"temp_video_only_{unique_id}.mp4")
+    temp_audio_path = os.path.join(temp_dir, f"temp_audio_only_{unique_id}.mp3")
+    temp_processed_video_path = os.path.join(temp_dir, f"temp_processed_video_no_audio_{unique_id}.mp4")
 
-    if not cap.isOpened():
-        raise Exception(f"Video açılamadı: {video_path}")
+    # Yüz algılayıcı (MTCNN) ve landmark modeli (dlib) yükle
+    detector = MTCNN(keep_all=True, device=device)
+    try:
+        predictor = dlib.shape_predictor("model/shape_predictor_68_face_landmarks.dat")
+    except Exception as e:
+        raise FileNotFoundError(
+            f"dlib landmark predictor dosyası bulunamadı: shape_predictor_68_face_landmarks.dat. Lütfen doğru yola indirin. Hata: {e}")
 
-    # Video özelliklerini güvenli şekilde al
-    fps = safe_get_video_property(cap, cv2.CAP_PROP_FPS)
-    width = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_WIDTH)
-    height = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_HEIGHT)
-    frame_count = safe_get_video_property(cap, cv2.CAP_PROP_FRAME_COUNT)
+    # Temizlik için tüm geçici dosyaları takip et
+    temp_files_to_clean = []
 
-    # Varsayılan değerler
-    if fps is None or fps <= 0:
-        fps = 30.0
-        print("FPS okunamadı, varsayılan 30 FPS kullanılıyor")
+    try:
+        # ----- 1. Adım: Orijinal Videodan Ses ve Video Ayırma -----
+        progress_status['status'] = "extracting_audio_video"
+        print("Orijinal videodan ses ve video ayrıştırılıyor...")
 
-    if width is None or height is None:
-        # İlk frame'den boyutları al
-        ret, first_frame = cap.read()
-        if ret:
-            height, width = first_frame.shape[:2]
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Başa dön
-        else:
-            raise Exception("Video boyutları okunamadı")
+        # `with` ifadesi, klibin otomatik olarak kapatılmasını sağlar
+        with VideoFileClip(video_path) as original_clip:
+            # Video kısmını kaydet
+            original_clip.write_videofile(temp_video_no_audio_path,
+                                          codec='libx264',
+                                          audio_codec=None,  # Ses olmadan kaydet
+                                          fps=original_clip.fps,
+                                          verbose=False,  # Konsol çıktısını azalt
+                                          logger=None)  # Logger'ı devre dışı bırak
+            temp_files_to_clean.append(temp_video_no_audio_path)
+            print(f"Video ayrıştırıldı: {temp_video_no_audio_path}")
 
-    if frame_count is None or frame_count <= 0:
-        print("Frame sayısı okunamadı, manuel sayım yapılıyor...")
-        frame_count = count_frames_manually(cap)
-        print(f"Toplam frame sayısı: {frame_count}")
-
-    # Video writer'ı oluştur
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (int(width), int(height)))
-
-    if not out.isOpened():
-        raise Exception(f"Çıkış video dosyası oluşturulamadı: {output_path}")
-
-    # Yeni yüz resmini yükle ve landmark'larını çıkar
-    new_face_img = cv2.imread(new_face_path)
-    if new_face_img is None:
-        raise Exception(f"Yeni yüz resmi yüklenemedi: {new_face_path}")
-
-    new_face_gray = cv2.cvtColor(new_face_img, cv2.COLOR_BGR2GRAY)
-    new_faces = detector(new_face_gray)
-    if len(new_faces) == 0:
-        raise Exception("Yeni yüz resmi bulunamadı.")
-
-    new_landmarks = predictor(new_face_gray, new_faces[0])
-    new_points_68 = np.array([[p.x, p.y] for p in new_landmarks.parts()], dtype=np.float32)
-
-    # Genişletilmiş yüz noktaları
-    new_points_enhanced = get_enhanced_face_points(new_landmarks)
-
-    # Yeni yüzü GPU'ya yükle
-    new_face_tensor = to_tensor(new_face_img).to(device)
-
-    frame_index = 0
-    processed_frames = 0
-
-    print(f"Video işleme başlıyor... Toplam frame: {frame_count}")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        try:
-            # Orijinal frame'i GPU'ya taşı
-            frame_tensor = to_tensor(frame).to(device)
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = detector(gray)
-
-            if len(faces) > 0:
-                face = faces[0]
-                landmarks = predictor(gray, face)
-                points_68 = np.array([[p.x, p.y] for p in landmarks.parts()], dtype=np.float32)
-
-                # Hedef yüz için genişletilmiş noktalar
-                target_points_enhanced = get_enhanced_face_points(landmarks)
-
-                # Detaylı triangulation
-                triangles, all_target_points = get_detailed_triangulation(target_points_enhanced, frame.shape)
-                _, all_source_points = get_detailed_triangulation(new_points_enhanced, new_face_img.shape)
-
-                # Warped face'i GPU'da oluştur
-                warped_face = torch.zeros((3, int(height), int(width)), dtype=torch.float32, device=device)
-                accumulated_mask = torch.zeros((int(height), int(width)), dtype=torch.float32, device=device)
-
-                # Her üçgen için warp işlemi
-                valid_triangles = 0
-                for tri_idx in triangles:
-                    # Üçgen noktalarının geçerli olup olmadığını kontrol et
-                    if (tri_idx < len(all_target_points)).all() and (tri_idx < len(all_source_points)).all():
-
-                        target_tri = all_target_points[tri_idx].astype(np.float32)
-                        source_tri = all_source_points[tri_idx].astype(np.float32)
-
-                        # Çok küçük üçgenleri atla
-                        if cv2.contourArea(target_tri) < 10:
-                            continue
-
-                        try:
-                            # Affine transformation
-                            M = cv2.getAffineTransform(source_tri, target_tri)
-
-                            # GPU'da warp işlemi
-                            warped_tri = warp_affine_torch(new_face_tensor, M, (int(width), int(height)))
-
-                            # Üçgen maskesi oluştur
-                            mask_tri = np.zeros((int(height), int(width)), dtype=np.uint8)
-                            cv2.fillConvexPoly(mask_tri, target_tri.astype(np.int32), 1)
-
-                            # Anti-aliasing için hafif blur
-                            mask_tri_blurred = cv2.GaussianBlur(mask_tri, (3, 3), 0.5)
-                            mask_tri_tensor = torch.from_numpy(mask_tri_blurred).to(device).float() / 255.0
-
-                            # Maskeyi uygula
-                            mask_tri_3d = mask_tri_tensor.unsqueeze(0)
-                            warped_face += warped_tri * mask_tri_3d
-                            accumulated_mask += mask_tri_tensor
-
-                            valid_triangles += 1
-
-                        except Exception as e:
-                            continue
-
-                # Accumulated mask ile normalize et
-                accumulated_mask = torch.clamp(accumulated_mask, min=1e-6)
-                warped_face = warped_face / accumulated_mask.unsqueeze(0)
-
-                # Gelişmiş yüz maskesi oluştur (alın dahil)
-                face_mask_smooth = create_smooth_mask(target_points_enhanced, frame.shape, feather_amount=20)
-                face_mask_tensor = torch.from_numpy(face_mask_smooth).to(device).float() / 255.0
-
-                # Multi-level blending
-                alpha = face_mask_tensor.unsqueeze(0)
-                blended = alpha * warped_face + (1 - alpha) * frame_tensor
-
-                # Sonucu CPU'ya geri al
-                output = to_numpy(blended.clamp(0, 1))
-
-                # Opsiyonel: Son rötuş için OpenCV seamlessClone
-                center = (face.left() + face.width() // 2, face.top() + face.height() // 2)
-                try:
-                    # Sadece merkezi yüz bölgesi için seamless clone
-                    center_mask = create_smooth_mask(points_68, frame.shape, feather_amount=10)
-                    warped_face_cpu = to_numpy(warped_face.clamp(0, 1))
-                    output_seamless = cv2.seamlessClone(warped_face_cpu, output, center_mask, center, cv2.NORMAL_CLONE)
-
-                    # İki sonucu karıştır (seams için)
-                    blend_ratio = 0.7
-                    output = cv2.addWeighted(output, 1 - blend_ratio, output_seamless, blend_ratio, 0)
-
-                except Exception as e:
-                    # Hata durumunda GPU blending sonucunu kullan
-                    pass
-
+            # Ses kısmını kaydet (varsa)
+            if original_clip.audio:
+                original_clip.audio.write_audiofile(temp_audio_path, codec='mp3', verbose=False, logger=None)
+                temp_files_to_clean.append(temp_audio_path)
+                print(f"Ses ayrıştırıldı: {temp_audio_path}")
             else:
-                output = frame
+                print("Orijinal videoda ses bulunamadı.")
+                temp_audio_path = None  # Ses olmadığı bilgisini sakla
 
-            out.write(output)
-            processed_frames += 1
+        # ----- 2. Adım: Yeni yüz resmini işle -----
+        progress_status['status'] = "processing_new_face"
+        img_new_face = cv2.imread(new_face_path)
+        if img_new_face is None:
+            raise FileNotFoundError(f"Yeni yüz resmi bulunamadı: {new_face_path}")
 
-        except Exception as e:
-            print(f"Frame {frame_index} işlenirken hata: {e}")
-            # Hata durumunda orijinal frame'i yaz
-            out.write(frame)
-            processed_frames += 1
+        # MTCNN, PIL görüntüsü bekler, bu yüzden OpenCV'den PIL'e dönüştürün
+        img_new_face_pil = Image.fromarray(cv2.cvtColor(img_new_face, cv2.COLOR_BGR2RGB))
+        boxes_new, _ = detector.detect(img_new_face_pil)
 
-        frame_index += 1
+        if boxes_new is None or len(boxes_new) == 0:
+            raise Exception("Sağlanan yeni yüz resminde herhangi bir yüz tespit edilemedi.")
 
-        # Progress güncelle
-        if progress_status is not None and frame_count > 0:
-            progress_status['progress'] = int((frame_index / frame_count) * 100)
+        bbox_new_coords = boxes_new[0]
+        shape_new = dlib.rectangle(
+            int(bbox_new_coords[0]), int(bbox_new_coords[1]),
+            int(bbox_new_coords[2]), int(bbox_new_coords[3])
+        )
+        # Yeni yüz resmini gri tonlamalıya çevirip dlib'e verin
+        landmarks_new = predictor(cv2.cvtColor(img_new_face, cv2.COLOR_BGR2GRAY), shape_new)
+        landmarks_new = [(p.x, p.y) for p in landmarks_new.parts()]
 
-        # Her 30 frame'de bir ilerleme raporu
-        if frame_index % 30 == 0:
-            print(f"İşlenen frame: {frame_index}/{frame_count} ({(frame_index / frame_count * 100):.1f}%)")
+        # ----- 3. Adım: Ayrıştırılmış Videoyu İşle (Yüz Değiştirme) -----
+        progress_status['status'] = "swapping_faces"
+        print("Video kareleri üzerinde yüz değiştirme işlemi başlatılıyor...")
 
-    cap.release()
-    out.release()
+        cap = cv2.VideoCapture(temp_video_no_audio_path)
+        if not cap.isOpened():
+            raise IOError(f"Geçici video dosyası açılamadı: {temp_video_no_audio_path}")
 
-    print(f"Video işleme tamamlandı. Toplam işlenen frame: {processed_frames}")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count == 0:
+            # Manuel frame sayımı
+            pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            count = 0
+            while True:
+                ret, _ = cap.read()
+                if not ret:
+                    break
+                count += 1
+            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            frame_count = count
+            if frame_count == 0:
+                raise ValueError("Geçici video dosyasında okunacak kare (frame) bulunamadı.")
 
-    # Çıkış dosyasının var olup olmadığını kontrol et
-    if not os.path.exists(output_path):
-        raise Exception("Çıkış video dosyası oluşturulamadı")
+        out = cv2.VideoWriter(temp_processed_video_path, fourcc, fps, (width, height))
+        temp_files_to_clean.append(temp_processed_video_path)
 
-    return processed_frames
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # MTCNN, PIL görüntüsü bekler, bu yüzden OpenCV'den PIL'e dönüştürün
+            frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            boxes, _ = detector.detect(frame_pil)
+
+            if boxes is None or len(boxes) == 0:
+                out.write(frame)  # Yüz bulunamazsa orijinal kareyi yaz
+            else:
+                bbox_coords = boxes[0]  # İlk bulunan yüzü al
+
+                # dlib.rectangle için koordinatları int'e çevir ve dörtlüye ayarla
+                shape = dlib.rectangle(
+                    int(bbox_coords[0]), int(bbox_coords[1]),
+                    int(bbox_coords[2]), int(bbox_coords[3])
+                )
+                # Video karesini gri tonlamalıya çevirip dlib'e verin
+                landmarks_video = predictor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), shape)
+                landmarks_video = [(p.x, p.y) for p in landmarks_video.parts()]
+
+                # `swap_faces_single` için beklenen bbox formatı: [x, y, w, h]
+                x1, y1, x2, y2 = map(int, bbox_coords)
+                bbox_for_clone = [x1, y1, x2 - x1, y2 - y1]
+
+                # `swap_faces_single` fonksiyonunu çağır
+                swapped_frame = swap_faces_single(frame, img_new_face, landmarks_video, landmarks_new, bbox_for_clone)
+                out.write(swapped_frame)
+
+            frame_idx += 1
+            if frame_count > 0:
+                progress_status['progress'] = int(frame_idx / frame_count * 100)
+
+        cap.release()
+        out.release()
+        print(f"Video kareleri işlendi ve geçici dosyaya kaydedildi: {temp_processed_video_path}")
+        progress_status['progress'] = 100
+        progress_status['status'] = "video_processed"
+
+        # ----- 4. Adım: İşlenmiş Video ve Sesi Birleştirme -----
+        progress_status['status'] = "combining_audio_video"
+        print("İşlenmiş video ve sesi birleştiriliyor...")
+
+        with VideoFileClip(temp_processed_video_path) as processed_video_clip:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                with AudioFileClip(temp_audio_path) as audio_clip:
+                    # processed_video_clip'in sesini ayarla
+                    final_clip = processed_video_clip.set_audio(audio_clip)
+
+                    # Son çıktıyı kaydet
+                    final_clip.write_videofile(output_path, codec='libx264', audio_codec='aac', fps=fps, verbose=False,
+                                               logger=None)
+                    final_clip.close()
+            else:
+                # Ses yoksa sadece işlenmiş videoyu çıktı olarak kaydet
+                processed_video_clip.write_videofile(output_path, codec='libx264', audio_codec=None, fps=fps,
+                                                     verbose=False, logger=None)
+                print("Orijinal videoda ses olmadığı için sadece video kaydedildi.")
+
+        print(f"İşlem tamamlandı. Son video kaydedildi: {output_path}")
+        progress_status['status'] = "done"
+
+    except Exception as e:
+        print(f"Hata oluştu: {e}")
+        progress_status['status'] = "error"
+        progress_status['error'] = str(e)
+
+    finally:
+        # ----- 5. Adım: Geçici Dosyaları Temizleme -----
+        print("Geçici dosyalar temizleniyor...")
+        for temp_file in temp_files_to_clean:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception as e:
+                    print(f"Uyarı: Geçici dosya silinemedi {temp_file}: {e}")
+        # Eğer temp klasörü boşsa, onu da sil (isteğe bağlı)
+        if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+            try:
+                os.rmdir(temp_dir)
+            except Exception as e:
+                print(f"Uyarı: Geçici klasör silinemedi {temp_dir}: {e}")
+        print("Geçici dosyalar temizlendi.")
+
+
+def swap_faces_single(img_video_frame, img_new_face, landmarks_video_frame, landmarks_new_face, bbox_video_frame):
+    """
+    Tek bir karede yüz değiştirme işlemini gerçekleştirir.
+    img_video_frame: Video karesi (Hedef)
+    img_new_face: Yeni yüz resmi (Kaynak)
+    landmarks_video_frame: Video karesindeki yüzün landmark'ları
+    landmarks_new_face: Yeni yüz resmindeki yüzün landmark'ları
+    bbox_video_frame: Video karesindeki yüzün sınırlayıcı kutusu [x, y, w, h]
+    """
+    # Landmark indeksleri (dlib'in 68 noktalı modeline göre)
+    # Bu indeksler yüzün önemli kısımlarını (çene çizgisi, kaşlar, burun, gözler, ağız) kapsar.
+    # Bu seçimin, yüzün ana hatlarını doğru yakaladığından emin olun.
+    points_indexes = list(range(17)) + list(range(17, 27)) + list(range(27, 36)) + list(range(36, 48)) + \
+                     list(range(48, 60)) + list(range(60, 68))  # Tüm 68 landmark'ı dahil edelim
+
+    try:
+        points1 = np.float32([landmarks_new_face[i] for i in points_indexes])  # Yeni yüzdeki noktalar
+        points2 = np.float32([landmarks_video_frame[i] for i in points_indexes])  # Video karesindeki noktalar
+    except IndexError as e:
+        print(f"Uyarı: Landmark indeksleme hatası - {e}. Yüz değiştirme atlanıyor.")
+        return img_video_frame
+
+    # Konveks dışbükey bölgeleri bulma
+    hull1 = cv2.convexHull(points1)  # Yeni yüzdeki dışbükey kabuk
+    hull2 = cv2.convexHull(points2)  # Video karesindeki dışbükey kabuk
+
+    # Delaunay üçgenlemesi için dikdörtgen alanı ve üçgenleri bulma
+    rect = cv2.boundingRect(hull2)  # Video karesindeki yüzün dışbükey kabuğunu içeren dikdörtgen
+    subdiv = cv2.Subdiv2D(rect)
+    for p in points2:
+        subdiv.insert(tuple(p))
+    triangles = subdiv.getTriangleList()
+
+    # Landmark noktalarının indeksini bulmak için yardımcı fonksiyon
+    def find_index(pt, points_list):
+        for i, p in enumerate(points_list):
+            if np.linalg.norm(pt - p) < 1.0:  # Noktalar arasında çok küçük bir farka izin ver
+                return i
+        return -1
+
+    triangle_indices = []
+    for t in triangles:
+        pts = [t[0:2], t[2:4], t[4:6]]  # Her üçgenin 3 köşesi
+        idx = []
+        for p in pts:
+            # points2'deki orijinal indeksleri bul
+            i = find_index(np.float32(p), points2)
+            if i != -1:
+                idx.append(i)
+        if len(idx) == 3:
+            # Orijinal points2 listesindeki indeksleri tut
+            triangle_indices.append(tuple(idx))
+
+    # Yeni yüzü video karesine göre warped (eğilmiş) hale getireceğimiz boş bir görüntü
+    img1_warped = np.zeros_like(img_video_frame, dtype=np.float32)  # float32 yapıyoruz çünkü çarpma işlemleri olacak
+
+    # Her üçgen için affine dönüşüm uygulama
+    for tri in triangle_indices:
+        x, y, z = tri
+        # Yeni yüzdeki üçgenin köşeleri
+        t1 = np.float32([points1[x], points1[y], points1[z]])
+        # Video karesindeki üçgenin köşeleri
+        t2 = np.float32([points2[x], points2[y], points2[z]])
+
+        # Üçgenlerin sınırlayıcı dikdörtgenleri
+        r1 = cv2.boundingRect(t1)  # Yeni yüzdeki üçgenin bbox'ı
+        r2 = cv2.boundingRect(t2)  # Video karesindeki üçgenin bbox'ı
+
+        # Dikdörtgenlere göre üçgen koordinatlarını ofsetleme
+        t1_rect = np.array([[p[0] - r1[0], p[1] - r1[1]] for p in t1], dtype=np.float32)
+        t2_rect = np.array([[p[0] - r2[0], p[1] - r2[1]] for p in t2], dtype=np.float32)
+
+        # Dönüşüm için maske oluşturma
+        mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)  # float32 maske
+        cv2.fillConvexPoly(mask, np.int32(t2_rect), (1, 1, 1))  # Üçgeni beyaz (1) ile doldur
+
+        # Yeni yüz resminden üçgen bölgesini kesme
+        img1_rect = img_new_face[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]].copy()
+
+        # Boş boyutlu kesitler için kontrol
+        if img1_rect.shape[0] == 0 or img1_rect.shape[1] == 0:
+            continue  # Bu üçgeni atla
+
+        # Affine dönüşüm matrisini hesaplama
+        warp_mat = cv2.getAffineTransform(t1_rect, t2_rect)
+
+        # Yeni yüzdeki üçgeni video karesindeki üçgenin konumuna dönüştürme
+        warped_triangle = cv2.warpAffine(img1_rect, warp_mat, (r2[2], r2[3]), None, flags=cv2.INTER_LINEAR,
+                                         borderMode=cv2.BORDER_REFLECT_101)
+
+        # Warped üçgeni maske ile çarpıp hedef görüntüye ekleme
+        # Önce mevcut alanı temizle, sonra warped üçgeni ekle
+        img1_warped[r2[1]:r2[1] + r2[3], r2[0]:r2[0] + r2[2]] = \
+            img1_warped[r2[1]:r2[1] + r2[3], r2[0]:r2[0] + r2[2]] * (1 - mask) + (
+                        warped_triangle.astype(np.float32) * mask)
+
+    # Son yüz maskesi oluşturma
+    mask = np.zeros_like(img_video_frame[:, :, 0], dtype=np.uint8)
+    convex_hull = cv2.convexHull(np.int32(points2))  # Video karesindeki yüzün dışbükey kabuğu
+    cv2.fillConvexPoly(mask, convex_hull, 255)  # Bu bölgeyi maske olarak kullan
+
+    # seamlessClone için yüzün merkezi
+    # bbox_video_frame formatı: [x, y, w, h]
+    center = (bbox_video_frame[0] + bbox_video_frame[2] // 2, bbox_video_frame[1] + bbox_video_frame[3] // 2)
+
+    # seamlessClone kullanarak yüzü harmanlama
+    # np.uint8'e dönüştürmeyi unutmayın
+    output = cv2.seamlessClone(
+        np.uint8(img1_warped),  # Kaynak görüntü (warped yeni yüz)
+        np.uint8(img_video_frame),  # Hedef görüntü (video karesi)
+        np.uint8(mask),  # Kaynak görüntünün maskesi
+        center,  # Hedef görüntüdeki konum
+        cv2.NORMAL_CLONE  # Harmanlama modu
+    )
+
+    return output
